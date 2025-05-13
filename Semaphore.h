@@ -10,12 +10,15 @@
 
 class Semaphore {
 public:
-    Semaphore(int limitSize = 0) : limitSize_(limitSize) {}
+    Semaphore(int limitSize = 0) : limitSize_(limitSize), isExist_(true) {}
 
-    ~Semaphore() = default;
+    ~Semaphore() {
+        isExist_ = false;
+    }
 
 public:
     void wait() {
+        if (!isExist_)return;
         std::unique_lock<std::mutex> lock(mutex_);
         con_.wait(lock, [&]() -> bool {
             return limitSize_ > 0;
@@ -24,12 +27,14 @@ public:
     }
 
     void post() {
+        if (!isExist_)return;
         std::unique_lock<std::mutex> lock(mutex_);
         limitSize_++;
         con_.notify_all();
     }
 
 private:
+    std::atomic<bool> isExist_;
     std::mutex mutex_;
     std::condition_variable con_;
     int limitSize_;

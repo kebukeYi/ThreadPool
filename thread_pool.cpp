@@ -4,15 +4,28 @@
 #include "functional"
 #include "iostream"
 
-const int TASK_MAX_SIZE = 4;
+const int TASK_MAX_SIZE = 80;
+const int THREAD_MAX_SIZE = 8;
+const int THREAD_MAX_TIME_OUT = 10; // 单位秒
 
 ThreadPool::ThreadPool()
-        : initThreadPoolSize_(4),
+        : initThreadPoolSize_(0),
+          currentThreadSize_(0),
+          idleThreadSize_(0),
           taskQueSize_(0),
+          maxThreadSize_(THREAD_MAX_SIZE),
           taskQueMaxThreshold_(TASK_MAX_SIZE),
           poolMode_(PoolMODE::MODE_FIXED) {}
 
-ThreadPool::~ThreadPool() {}
+ThreadPool::~ThreadPool() {
+    isRunning_ = false;
+//    notEmpty_.notify_all();// 唤醒所有线程进行判断是否释放资源;
+    std::unique_lock<std::mutex> lock(taskQueMux_);
+    notEmpty_.notify_all();// 唤醒所有线程进行判断是否释放资源;
+    closePool_.wait(lock, [&]() -> bool {
+        return threadPool_.size() == 0;
+    });
+}
 
 void ThreadPool::setMode(PoolMODE poolMode) {
     poolMode_ = poolMode;
@@ -22,7 +35,8 @@ void ThreadPool::setTaskQueThreshHold(size_t threshold) {
     taskQueMaxThreshold_ = threshold;
 }
 
-Result ThreadPool::submitTask(const std::shared_ptr<Task>& task) {
+// 生产任务;
+Result ThreadPool::submitTask(const std::shared_ptr<Task> &task) {
     // 获得任务队列锁;
     std::unique_lock<std::mutex> lock(taskQueMux_);
 
@@ -45,43 +59,91 @@ Result ThreadPool::submitTask(const std::shared_ptr<Task>& task) {
     taskQue_.emplace(task);
     taskQueSize_++;
 
-    // 队列有数据, 分配 线程池的线程去消费;
+    // 队列有数据了, 通知 线程池的线程去消费;
     notEmpty_.notify_all();
+
+    // 判断cache模式下, 是否需要创建新线程;
+    if (poolMode_ == PoolMODE::MODE_CACHE &&
+        currentThreadSize_ < maxThreadSize_ &&
+        idleThreadSize_ < taskQueSize_) {
+        // 创建线程;
+        auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
+        int threadId = ptr->getId();
+        // threadPool_.emplace_back(ptr); // unique 对象不允许普通拷贝和赋值;
+        threadPool_.emplace(threadId, std::move(ptr)); // 因此进行资源转移;
+        // 启动线程;
+//        ptr->start();
+        threadPool_[threadId]->start();
+        std::cout << "thread new id :" << threadId << std::endl;
+        // 修改当前线程数量;
+        currentThreadSize_++;
+    }
+
     // Result 是生命周期大于 task 的;
     return Result(task);
 }
 
 void ThreadPool::start(int initThreadPoolSize) {
     initThreadPoolSize_ = initThreadPoolSize;
-
+    isRunning_ = true;
     for (int i = 0; i < initThreadPoolSize_; ++i) {
-        auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this));
+        auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::threadFunc, this, std::placeholders::_1));
+        int threadId = ptr->getId();
         // threadPool_.emplace_back(ptr); // unique 对象不允许普通拷贝和赋值;
-        threadPool_.emplace_back(std::move(ptr)); // 因此进行资源转移;
+        threadPool_.emplace(threadId, std::move(ptr)); // 因此进行资源转移;
+        // ptr->start(); // std::move(ptr), 所以会导致null指针异常;
     }
 
     for (int i = 0; i < initThreadPoolSize_; ++i) {
         threadPool_[i]->start();
+        currentThreadSize_++;
+        idleThreadSize_++;
     }
 }
 
 // 线程池定义好 访问自己成员属性的函数,并让线程去绑定调用;
-void ThreadPool::threadFunc() {
+// 消费任务;
+void ThreadPool::threadFunc(int threadId) {
 //    std::cout << "threadFunc start, tid:" << std::this_thread::get_id() << std::endl;
 //    std::cout << "threadFunc end, tid:" << std::this_thread::get_id() << std::endl;
+    auto lastTime = std::chrono::high_resolution_clock::now();
     for (;;) {
         // 获得锁;
         std::unique_lock<std::mutex> lock(taskQueMux_);
-
-        // 是否非空;
-        notEmpty_.wait(lock, [&]() -> bool {
-            return !taskQue_.empty();
-        });
+        // 双重锁+判断;
+        while (taskQue_.empty()) {
+            if (!isRunning_) {
+                threadPool_.erase(threadId);
+                closePool_.notify_all();
+                std::cout << "thread close id :" << threadId << std::endl;
+                return;
+            }
+            if (poolMode_ == PoolMODE::MODE_CACHE) {
+                auto res = notEmpty_.wait_for(lock, std::chrono::seconds(1));
+                if (res == std::cv_status::timeout) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
+                    if (duration.count() > THREAD_MAX_TIME_OUT && currentThreadSize_ > initThreadPoolSize_) {
+                        // 销毁线程;
+                        threadPool_.erase(threadId);
+                        // 数量减一;
+                        currentThreadSize_--;
+                        idleThreadSize_--;
+                        std::cout << "thread exit id :" << threadId << std::endl;
+                        return;
+                    }
+                }
+            } else {
+                // 检测是否非空,一直阻塞;
+                notEmpty_.wait(lock);
+            }
+        }
 
         // 获取队列头部任务;
         auto task = taskQue_.front();
         taskQue_.pop();
         taskQueSize_--;
+        idleThreadSize_--;
 
         // 如果还有任务, 可通知其他阻塞线程去消费;
         if (!taskQue_.empty()) {
@@ -91,18 +153,27 @@ void ThreadPool::threadFunc() {
         // 取出任务后,进行通知,可生产;
         notFull_.notify_all();
 
+
         // 取出任务后,即可释放锁;
         lock.unlock();
 
         // 执行任务;
 //        task->run();
+        std::cout << "MyTask run, tid: " << threadId << std::endl;
         task->exec();
+        idleThreadSize_++;
+        std::cout << "MyTask end, tid: " << threadId << std::endl;
+        lastTime = std::chrono::high_resolution_clock::now();
     }
+
 }
 
-Thread::Thread(ThreadFunc threadFunc) {
-    // threadFunc_ = threadFunc;
-    threadFunc_ = std::move(threadFunc);
+
+int Thread::threadIdGen_ = 0;
+
+Thread::Thread(ThreadFunc threadFunc) :
+        threadFunc_(threadFunc),
+        threadId_(threadIdGen_++) {
 }
 
 Thread::~Thread() {}
@@ -110,8 +181,12 @@ Thread::~Thread() {}
 // 每个线程需要访问到 线程池中的任务队列,怎么访问?
 void Thread::start() {
     // 启动一个线程, 执行线程池提供的执行函数;
-    std::thread t(threadFunc_);
+    std::thread t(threadFunc_, threadId_);
     t.detach();// 分离t线程,防止当前函数 start()函数结束后,进行析构;
+}
+
+int Thread::getId() const {
+    return threadId_;
 }
 
 
